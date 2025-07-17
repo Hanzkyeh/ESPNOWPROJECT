@@ -1,0 +1,206 @@
+#include <TFT_eSPI.h> // Or use Adafruit_ILI9341 if you wish, just update code accordingly
+#include <SPI.h>
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+
+// --- Data Structures (must match sender/measurement device and controller) ---
+typedef struct struct_message {
+  int id;
+  float voltage;
+  float current;
+  float power;
+  float energy;
+  float frequency;
+  float powerFactor;
+} struct_message;
+
+typedef struct struct_order {
+  bool switch1;
+  bool switch2;
+  bool switch3;
+  bool switch4;
+  bool switch5;
+  bool switch6;
+  char logicState; // 'A','B','C','D','E','F'
+} struct_order;
+
+// --- TFT LCD ---
+TFT_eSPI tft = TFT_eSPI();  // For ILI9341
+
+// --- Table/Display Variables ---
+const int tableRows = 7;
+const int tableCols = 4;
+int cellWidth;
+int voltageWidth = 30;
+const int defaultCellWidth = 75;
+const int cellHeight = 30;
+const int startX = 0;
+const int startY = 10;
+
+String dummyData[tableRows][tableCols] = {
+  {"S", "V", "I", "P"},
+  {"1", "0.000", "0.000", "0.000"},
+  {"2", "0.000", "0.000", "0.000"},
+  {"3", "0.000", "0.000", "0.000"},
+  {"4", "0.000", "0.000", "0.000"},
+  {"5", "0.000", "0.000", "0.000"},
+  {"6", "0.000", "0.000", "0.000"},
+};
+
+String data[tableRows][tableCols];
+String TABLE_HEADER[tableCols] = {"S", "V (V)", "I (A)", "P (W)"};
+
+// --- Data Handler ---
+struct_message dataSensor;
+struct_order orderToSend;
+
+// --- MAC addresses for measurement devices/peers (fill with yours!) ---
+uint8_t receiverAddresses[6][6] = {
+  {0xF8, 0xB3, 0xB7, 0x81, 0xBF, 0x1D}, // device 1
+  {0xF0, 0x08, 0xD1, 0x01, 0xF0, 0x31}, // device 2
+  {0xF8, 0xB3, 0xB7, 0x81, 0xBF, 0x1D}, // device 3
+  {0x84, 0x0D, 0x8E, 0x92, 0x99, 0x28}, // device 4
+  {0x8C, 0xAA, 0xB5, 0x0C, 0xBB, 0x41}, // device 5
+  {0x68, 0xC6, 0x3A, 0xFC, 0x8C, 0x45},  // device 6
+};
+
+// --- Helper: Compute order for relays (from power reading) ---
+void computeOrder(float power, struct_order *order) {
+  if(power < 30) { // F: all off
+    order->switch1 = false; order->switch2 = false; order->switch3 = false; order->switch4 = false; order->switch5 = false; order->logicState = 'F';
+  } else if(power >= 50 && power < 100) { // E: on,off,off,off,off
+    order->switch1 = true; order->switch2 = false; order->switch3 = false; order->switch4 = false; order->switch5 = false; order->logicState = 'E';
+  } else if(power >= 100 && power < 150) { // D: on,on,off,off,off
+    order->switch1 = true; order->switch2 = true; order->switch3 = false; order->switch4 = false; order->switch5 = false; order->logicState = 'D';
+  } else if(power >= 150 && power < 270) { // C: on,on,on,off,off
+    order->switch1 = true; order->switch2 = true; order->switch3 = true; order->switch4 = false; order->switch5 = false; order->logicState = 'C';
+  } else if(power >= 270 && power < 300) { // B: on,on,on,on,off
+    order->switch1 = true; order->switch2 = true; order->switch3 = true; order->switch4 = true; order->switch5 = false; order->logicState = 'B';
+  } else if(power >= 300) { // A: all on
+    order->switch1 = true; order->switch2 = true; order->switch3 = true; order->switch4 = true; order->switch5 = true; order->logicState = 'A';
+  } else { // fallback: all off
+    order->switch1 = false; order->switch2 = false; order->switch3 = false; order->switch4 = false; order->switch5 = false; order->logicState = 'F';
+  }
+}
+
+// --- Send control order to all measurement devices ---
+void sendOrderToAllReceivers(struct_order *order) {
+  for(int i = 0; i < 6; i++) {
+    esp_now_send(receiverAddresses[i], (uint8_t*)order, sizeof(struct_order));
+    delay(10); // Small delay to ensure packets are sent
+  }
+  Serial.print("Order sent to all. Logic state: ");
+  Serial.println(order->logicState);
+}
+
+// --- Save received values to table array for display ---
+void saveValueOnArray(struct struct_message* dataSensor){
+  data[dataSensor->id][0] = String(dataSensor->id);
+  data[dataSensor->id][1] = String(dataSensor->voltage, 3);
+  data[dataSensor->id][2] = String(dataSensor->current, 3);
+  data[dataSensor->id][3] = String(dataSensor->power, 3);
+}
+
+// --- Display table on ILI9341 ---
+void drawTable(String data[tableRows][tableCols]) {
+  // Optional: clear table area (if flicker, remove this)
+  tft.fillRect(0, 0, tft.width(), tft.height(), TFT_BLACK);
+
+  // Draw the table grid
+  for (int row = 0; row <= tableRows; row++) {
+    int y = startY + row * cellHeight;
+    tft.drawLine(startX, y, startX + tableCols * defaultCellWidth, y, TFT_WHITE); // Horizontal line
+  }
+  for (int col = 0; col <= tableCols; col++) {
+    cellWidth = col == 1 ? voltageWidth : defaultCellWidth;
+    int x = startX + col * cellWidth;
+    tft.drawLine(x, startY, x, startY + tableRows * cellHeight, TFT_WHITE); // Vertical line
+  }
+  // Fill in the table with data
+  for (int row = 0; row < tableRows; row++) {
+    for (int col = 0; col < tableCols; col++) {
+      cellWidth = col == 1  ? voltageWidth : defaultCellWidth; 
+      int textX = startX + col * cellWidth + 5;
+      int textY = startY + row * cellHeight + 5;
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setCursor(textX, textY);
+      tft.print(data[row][col]);
+    }
+  }
+}
+
+// --- Serial Debug Print (for monitoring) ---
+void serialDebug(struct struct_message* dataSensor){
+  Serial.print("Alat: ");         Serial.println(dataSensor->id);
+  Serial.print("Voltage: ");      Serial.print(dataSensor->voltage);      Serial.println("V");
+  Serial.print("Current: ");      Serial.print(dataSensor->current);      Serial.println("A");
+  Serial.print("Power: ");        Serial.print(dataSensor->power);        Serial.println("W");
+  Serial.print("Energy: ");       Serial.print(dataSensor->energy);     Serial.println("kWh");
+  Serial.print("Frequency: ");    Serial.print(dataSensor->frequency); Serial.println("Hz");
+  Serial.print("PF: ");           Serial.println(dataSensor->powerFactor);
+  Serial.println();
+}
+
+// --- ESP-NOW Callback: Handles incoming measurement data from devices ---
+void OnDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len) {
+  memcpy(&dataSensor, incomingData, sizeof(dataSensor));
+
+  Serial.print("Bytes received: ");
+  Serial.println(len);
+  serialDebug(&dataSensor);
+
+  // Always update table header
+  for(int col = 0; col < tableCols; col++){
+    data[0][col] = TABLE_HEADER[col];
+  }
+
+  // Fill data for table, update only the right row
+  if(dataSensor.id == 1) saveValueOnArray(&dataSensor);
+  if(dataSensor.id == 2) saveValueOnArray(&dataSensor);
+  if(dataSensor.id == 3) saveValueOnArray(&dataSensor);
+  if(dataSensor.id == 4) saveValueOnArray(&dataSensor);
+  if(dataSensor.id == 5) saveValueOnArray(&dataSensor);
+  if(dataSensor.id == 6) saveValueOnArray(&dataSensor);
+
+  drawTable(data);
+
+  // MAIN CONTROL: Only use for one sensor (example: id==3, as per your logic)
+  if(dataSensor.id == 6) {
+    computeOrder(dataSensor.power, &orderToSend);
+    sendOrderToAllReceivers(&orderToSend);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(3);
+  tft.fillScreen(TFT_BLACK);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != 0) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register all peers (uncomment/add your addresses as needed)
+  for(int i=0; i<6; i++) {
+    esp_now_add_peer(receiverAddresses[i], ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
+  }
+
+  esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Draw initial table
+  for (int i = 0; i < tableRows; i++)
+    for (int j = 0; j < tableCols; j++)
+      data[i][j] = dummyData[i][j];
+
+  drawTable(data);
+}
+
+void loop() {
+  // All logic handled in callback
+}
